@@ -1,0 +1,347 @@
+---
+title: 'TAP30 challenge'
+author: "Mohsen Mollayi"
+date: "March ,2018"
+output:
+  html_document:
+    keep_md: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+## Background and Introduction
+
+Estimating supply and demand is one of the most important problems for online transportation companies. Many of these companies' large scale business strategies depend on being able to accurately predict supply and demand at any point in time. For instance knowing that during certain times in the day the number of requests for rides exceeds the number of available drivers might lead the company to encourage drivers to work more during those times by providing incentives.
+
+In this challenge we are provided with data indicating the number of requests for rides per hour in different areas of Tehran spanning a period of several weeks. Some of the entries of these data are withheld and our job is to estimate them.
+
+## Loading and preprocessing the data
+
+Assuming `data.txt` is already in the working directory, I start by loading the required packages and then reading in the data (the data could be downloaded from [here](https://www.kaggle.com/c/tap30challenge/data)):
+
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(missForest)
+library(imputeTS)
+library(viridis)
+library(Hmisc)
+library(doParallel)
+
+tapc <- read.table("./data.txt",
+                sep =" ",
+                colClasses = "integer",
+                skip = 2,          # the first two rows are meta-data
+                na.strings = "-1") # missing data are denoted by "-1"
+
+head(tapc)
+```
+
+The data are formatted as a series of 732 successive $8×8$ matrices (732*8 rows) associated with 732 hour data on a $8×8$ grid. Every cell of the aforementioned grid represents an area of Tehran. To facilitate further analyses, I first transform the data into standard tidy formats:
+
+```{r}
+total_hour <- rep(1:732, each = 8)
+
+# in this format each matrix represents a row
+tapc_mat_raw <- cbind(total_hour, tapc) %>% 
+    group_by(total_hour) %>%
+    nest(.key = "data_in") %>% 
+    mutate(data_in = map(data_in, data.matrix))
+
+# making column names:
+fn <- partial(paste, sep = ".")
+nm <- outer(1:8, 1:8, "fn") %>% 
+    t %>% 
+    as.vector %>% 
+    paste0("coord_", .)
+
+# in this wide format each grid cell is represented as a separate column:
+tapc_wide_raw <- tapc_mat_raw %>%
+    mutate(data_in = map(data_in,
+                      ~ as.vector(t(.x)) %>%
+                          matrix(nrow = 1) %>%
+                          as.data.frame)
+    ) %>%
+    mutate(data_in = map(data_in, ~set_names(.x,nm))) %>% 
+    unnest %>% 
+    mutate(day = rep(1:31, each = 24, length.out = n()),   # adding day variable to the data
+           hour = rep(1:24, length.out = n())) %>%         # adding daily hours to the data
+    select(total_hour, day, hour, everything())
+
+# this is a long format in which every cell name is included in one variable:
+tapc_long_raw <- tapc_wide_raw %>% 
+    gather(key = "coord", value = "requests",
+           -day, -hour, -total_hour)
+tapc_long_raw
+```
+Now we have three data-frames each suitable for a particular task.
+
+## Data display and summary
+
+The obvious graph to start with is a time plot. So let's count the number of requests per hour and visualize it. I will also plot a pulse wave overlaid on the original data which I will explain later: 
+
+```{r, fig.width=8, fig.asp=0.5, fig.align="center", fig.cap = "Figure 1: There's a strong seasonal pattern which is not 24-hour periodic."}
+total_req <- tapc_long_raw %>% 
+    group_by(total_hour) %>%
+    summarise(total_requests = sum(requests, na.rm = TRUE))
+
+pulse <- c(rep(0, 10), rep(1, 14)) %>% 
+    rep(length.out = 732) %>% 
+    lead(3, default = 1)
+
+total_req %>%
+    mutate(pulse = 5000 * pulse) %>% 
+    ggplot(aes(total_hour, total_requests)) +
+    geom_line(size = 0.5) + 
+    geom_line(aes(total_hour, pulse), color = "red", linetype = 5) +
+    coord_cartesian(ylim = c(0, 17000)) +
+    scale_x_continuous(breaks = seq(0, 730, 50))
+```
+
+The time plot immediately reveals some interesting features:
+
+- There is a period of reduced load which lasts five days. I think this was either due to Nowruz holidays or with less probability due to Tehran heavy snow in Bahman.
+- A large increase in ride requests occurs in the last day which haven't been shown in the graph because of its high value.
+- There are some hours at which the total requests suddenly dips down to zero (for example look around hour 700).
+- There's a strong seasonal pattern but its period is not 24 hours. Notice that the pulse wave has period equal to 24.
+	
+The last two features hint at false data injection possibility. After more digging I made sure that this is indeed the case. Below I remove the hours which contain false data and then rebuild the data-frames and finally redo the last plot:
+```{r, fig.width=8, fig.asp=0.5, fig.align="center", fig.cap = "Figure 2: After removing false data, the seasonal pattern has the desired frequency."}
+exclude_idx <- c(6, 7, 171, 172, 291, 292, 687, 688, 690, 691, 692, 693)
+tapc_mat <- tapc_mat_raw %>%
+    slice(-exclude_idx) %>%
+    mutate(total_hour = 1:n())
+
+tapc_wide <- tapc_mat %>%
+    mutate(data_in = map(data_in,
+                      ~ as.vector(t(.x)) %>%
+                          matrix(nrow = 1) %>%
+                          as.data.frame)
+    ) %>%
+    mutate(data_in = map(data_in, ~set_names(.x,nm))) %>% 
+    unnest %>% 
+    mutate(day = rep(1:30, each = 24, length.out = n()),
+           hour = rep(1:24, length.out = n())) %>%
+    select(total_hour, day, hour, everything())
+
+tapc_long <- tapc_wide %>% 
+    gather(key = "coord", value = "requests",
+           -day, -hour, -total_hour)
+
+total_req <- tapc_long %>% 
+    group_by(total_hour) %>%
+    summarise(total_requests = sum(requests, na.rm = TRUE))
+
+pulse <- c(rep(0, 10), rep(1, 14)) %>% 
+    rep(length.out = 720) %>% 
+    lead(3, default = 1)
+
+total_req %>%
+    mutate(pulse = 5000 * pulse) %>% 
+    ggplot(aes(total_hour, total_requests)) +
+    geom_line(size = 0.5) + 
+    geom_line(aes(total_hour, pulse), color = "red", linetype = 5) +
+    coord_cartesian(ylim = c(0, 17000)) +
+    scale_x_continuous(breaks = seq(0, 720, 50))
+```
+After removing the false data, the seasonal pattern has the expected 24-hour period. Furthermore, the total number of hours is equal to 720 which amounts to 30 complete days.
+
+Another useful graph that will guide us through the rest of analysis is one that illustrates the number of requested per coordinate per hour.
+```{r, fig.width=10, fig.asp=0.6, fig.align="center", fig.cap = "Figure 3: There are various coordinates at which the number of requests are negligible."}
+tapc_long %>% 
+    filter(requests <= 300) %>%
+    ggplot(aes(total_hour, coord)) +
+    geom_tile(aes(fill = requests)) +
+    scale_fill_viridis() +
+    theme(axis.text.y = element_text(size = 8))
+```
+Based on the plot above, we can neglect many coordinates at which the number of request are very low and instead focus on coordinates with high load. Another important takeaway message from the last figure is the distribution of `NA`s which seems random.
+
+## Imputing missing values
+
+There are several packages in R for imputing missing values. But our situation doesn't allow us to use most of them. To explain why let's first calculate the proportion of missing values in the dataset:
+```{r}
+mean(is.na(tapc))
+```
+Most popular packages in R impute missing values just by analyzing the single variable for which the values are missing. Since 36% of our the data are missing, which means for each coordinate about 36% of the data are missing, this methods won't work for us. We need an approach that incorporate the whole dataset to estimate one particular missing value. The `missForest` package is a simple and powerful option. For a first attempt I pass `tapc_wide` directly to `missForrest()` function:
+```{r, message=FALSE}
+registerDoParallel(cores=3) # using 3 cores to run random-forest in parallel
+set.seed(612)
+wide_imp0 <- tapc_wide %>%
+    as.data.frame %>%   # missForest doesn't work with tibbles
+    missForest(mtry = 20, ntree = 150, parallelize = "variables") %>% .$ximp
+```
+Our naive attempt give us RMSE equal to 62.4 on the test set. To improve upon this, my idea is to add several features to the data which in turn would hopefully guide the algorithm toward better estimates.
+
+### Feature generation
+
+Let's get started by generating a vector that contains the coordinate names arranged based on the total number of requests in each coordinate:
+```{r}
+top_coords <- tapc_long %>% 
+    group_by(coord) %>% 
+    summarise(requests = sum(requests, na.rm = TRUE)) %>% 
+    arrange(desc(requests))
+
+cumsum(top_coords$requests) %>% 
+    (function(x) x[20]/x[64])
+```
+the top 20 coordinates contain 75% of total requests. I will narrow my focus toward them in the subsequent analyses.
+
+Next I proceed by clustering together the coordinates that follow similar patterns with respect to the number of request in different hours. I will cross check various measures to select out the variables for each cluster.
+```{r, fig.width=10, fig.asp=0.6, fig.align="center", fig.cap = "Figure 4: Left: coordinates clustering based on requests across all hours \\\n Right: coordinates clustering based on requests aggregated in a single day"}
+coords_daily <- tapc_long %>%
+    filter(day != 30) %>%
+    filter(coord %in% top_coords$coord[1:20]) %>% 
+    group_by(coord, hour) %>% 
+    summarise(requests = sum(requests, na.rm = TRUE)) %>% 
+    ungroup
+
+par(mfrow = c(1,2))
+tapc_wide %>% 
+    select(top_coords$coord[1:20]) %>% 
+    data.matrix %>% 
+    varclus(similarity = "pearson", method = "average") %>% 
+    plot
+
+coords_daily %>% 
+    spread(coord, requests) %>% 
+    select(-hour) %>% 
+    data.matrix %>% 
+    varclus(similarity = "pearson", method = "average") %>% 
+    plot
+```
+
+```{r, fig.width=10, fig.asp=0.8, fig.align="center", fig.cap = "Figure 5: Some coordinates follow similar patterns with respect to the total number of requests in each hour of day."}
+coords_daily %>% 
+    ggplot(aes(hour, requests)) +
+    geom_line() +
+    facet_wrap(~coord, nrow = 4, scales = "free_y")
+```
+After careful inspection, I came up with three cluster of coordinates. For each cluster, I will average the time series within that cluster and then use Kalman smoothing for imputation of the remaining `NA`s.
+```{r}
+cluster1 <- paste("coord", c(1.7, 2.7, 3.7, 4.7), sep = "_")
+cluster2 <- paste("coord", c(1.6, 3.6, 4.6, 5.6), sep = "_")
+cluster3 <- paste("coord", c(1.4, 2.4, 3.4, 3.5), sep = "_")
+
+kal_smoother <- function(clust) {
+    tapc_wide %>% 
+        select(clust) %>% 
+        rowMeans(na.rm = TRUE) %>% 
+        na.kalman()
+}
+
+coord_clust1 <- kal_smoother(cluster1)
+coord_clust2 <- kal_smoother(cluster2)
+coord_clust3 <- kal_smoother(cluster3)
+```
+Next I add these three time series as new variables to `tapc_wide`:
+
+```{r}
+wide_augmented <- cbind(tapc_wide, coord_clust1, coord_clust2, coord_clust3)
+```
+
+### Evaluation of the imputation method
+
+Now It's time to feed in our augmented dataset to the imputation algorithm.
+```{r, message=FALSE}
+set.seed(612)
+wide_imp1 <- wide_augmented[-1] %>%
+    as.data.frame %>%
+    missForest(mtry = 20, ntree = 150, parallelize = "variables") %>% .$ximp
+```
+To evaluate the quality of our estimates, I will use a graphical approach. The idea is that if our estimate are accurate, various distributional properties of the dataset should have not been changed. I start by evaluating the average daily request pattern, averaged across all days and coordinates.
+```{r, fig.width=5, fig.asp=0.7, fig.align="center", fig.cap="Figure 6: Pattern of average daily requests does not change after imputation."}
+wide_imp1 <- wide_imp1 %>% 
+    select(day:coord_8.8) %>%
+    mutate(total_hour = 1:720) %>% 
+    select(total_hour, everything())
+
+long_imp1 <- wide_imp1 %>% 
+    gather(key = "coord", value = "requests",
+           -day, -hour, -total_hour)
+
+day_pattern_imp1 <- long_imp1 %>% 
+    group_by(hour) %>% 
+    summarise(requests = mean(requests))
+
+day_pattern <- tapc_long %>% 
+    group_by(hour) %>% 
+    summarise(requests = mean(requests, na.rm = TRUE))
+
+day_pattern %>% 
+    ggplot(aes(hour, requests)) +
+    geom_line() +
+    geom_line(aes(hour, requests), data = day_pattern_imp1, color = "red")
+```
+Next I repeat the last plot but this time for each coordinate separately. Also instead of averaging I add the corresponding values up.
+
+```{r, fig.width=10, fig.asp=1, fig.align="center", fig.cap = "Figure 7: The algorithm did a good job overall."}
+coords_daily_imp1 <- long_imp1 %>%
+    filter(day != 30) %>% # Since day 30 data doesn't conform with the rest of the data
+    filter(coord %in% top_coords$coord[1:20]) %>% 
+    group_by(coord, hour) %>% 
+    summarise(requests = sum(requests)) %>% 
+    ungroup
+
+nc <- 1 / (1 - mean(is.na(tapc)))   # this is a normalizing constant
+coords_daily %>%
+    ggplot(aes(hour, nc * requests)) +
+    geom_line() +
+    geom_line(aes(hour, requests), data = coords_daily_imp1, color = "red") +
+    facet_wrap(~coord, nrow = 4, scales = "free_y")
+```
+After comparing the last two plot with the same plots but generated with `wide_imp0` (I haven't included those plots in this report), I concluded that the added features don't improve the algorithm much. The gain is just about 1.5% decrease in test error.
+
+## Appendix
+
+Here is the code for generating submission data:
+```{r}
+imped_mat <- wide_imp1 %>% 
+    select(-day, -hour) %>% 
+    group_by(total_hour) %>%
+    nest(.key = "data_out") %>% 
+    mutate(data_out = map(data_out, ~data.matrix(.x) %>%
+                          as.vector %>%
+                          matrix(nrow = 8) %>%
+                          t %>% 
+                          round)) %>% 
+    ungroup
+
+zero_filled <- tapc_mat_raw %>% 
+    slice(exclude_idx) %>% 
+    mutate(data_out = map(data_in, ~na.replace(.x, fill = 0))) %>% 
+    select(-data_in)
+    
+out_mat <- imped_mat %>% 
+    mutate(total_hour = setdiff(1:732, exclude_idx)) %>%
+    rbind(zero_filled) %>% 
+    arrange(total_hour) %>% 
+    mutate(data_out = map(data_out, data.frame))
+
+output_builder <- function(mat_raw, mat_filled) {
+    na_out <- vector("character", sum(is.na(mat_raw)))
+    k <- 1
+    for(i in 1:8) {
+        for(j in 1:8) {
+            if (is.na(mat_raw[i,j])) {
+                na_out[k] <- paste(i-1, j-1, sep = ":") %>% 
+                    paste(mat_filled[i,j], sep = ",")
+                k <- k + 1
+            }
+        }
+    }
+    na_out
+}
+
+submission <- full_join(tapc_mat_raw, out_mat) %>% 
+    transmute(out = map2(data_in, data_out, output_builder)) %>% 
+    mutate(total_hour = 0:731) %>% 
+    select(total_hour, out) %>% 
+    unnest(out) %>% 
+    transmute(out_str = paste(total_hour, out, sep = ":")) %>% 
+    rbind("id,demand", .)
+
+
+write.table(submission, file ="tap30.txt",
+            col.names = FALSE, row.names = FALSE,
+            quote = FALSE)
+```
